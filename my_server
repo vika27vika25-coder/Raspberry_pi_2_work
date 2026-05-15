@@ -54,7 +54,7 @@ constexpr uint32_t MAX_USERNAME = 64;
 // ============================================================
 // КОНФИГ
 // ============================================================
-constexpr int    PORT                 = 54000;
+constexpr int    PORT                 = 54002;
 constexpr int    MONITOR_INTERVAL_SEC = 10;
 constexpr double CPU_TEMP_LIMIT       = 70.0;
 constexpr int    RAM_LIMIT_PERCENT    = 80;
