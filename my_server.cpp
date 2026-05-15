@@ -1,6 +1,5 @@
 // ============================================================
-// Hardware Monitor Server (Raspberry Pi side)
-// Build: g++ -std=c++17 -O2 -pthread server.cpp -o server
+//  Server (Raspberry Pi side)
 // ============================================================
 #include <iostream>
 #include <vector>
@@ -28,17 +27,20 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <errno.h>
-
+#include <termios.h>   // настройка UART
+    
 // ============================================================
 // ПРОТОКОЛ
 // ============================================================
 enum class MessageType : uint32_t {
-    Text          = 1,
-    Connect       = 2,
-    Disconnect    = 3,
-    LogRequest    = 4,
-    LogResponse   = 5,
-    Warning       = 6
+    Text       = 1,
+    Connect    = 2,
+    Disconnect = 3,
+    LogRequest = 4,
+    LogResponse = 5,
+    Warning    = 6,
+    UartSend   = 7,   // ← клиент шлёт команду на STM
+    UartData   = 8    // ← RPi пересылает ответ STM клиенту
 };
 
 #pragma pack(push, 1)
@@ -84,6 +86,9 @@ static std::mutex          g_clientsMutex;
 static std::map<int, std::string> g_usedColors;
 static std::mutex                 g_colorsMutex;
 
+static int g_uartFd = -1;
+static std::mutex g_uartMutex;
+
 static const std::vector<std::string> g_colorPool = {
     "\033[31m","\033[32m","\033[33m",
     "\033[34m","\033[35m","\033[36m"
@@ -97,6 +102,25 @@ static std::ofstream             g_logFile;
 static std::vector<std::string>  g_logBuffer;
 static std::vector<std::string>  g_warningBuffer;
 static std::mutex                g_logMutex;
+
+
+static bool openUart(const char* device = "/dev/ttyAMA0", int baud = B9600) {
+    g_uartFd = open(device, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (g_uartFd < 0) return false;
+    termios opts{};
+    tcgetattr(g_uartFd, &opts);
+    cfsetispeed(&opts, baud);
+    cfsetospeed(&opts, baud);
+    opts.c_cflag |= (CLOCAL | CREAD);
+    opts.c_cflag &= ~PARENB;
+    opts.c_cflag &= ~CSTOPB;
+    opts.c_cflag &= ~CSIZE;
+    opts.c_cflag |= CS8;
+    opts.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tcsetattr(g_uartFd, TCSANOW, &opts);
+    return true;
+}
+
 
 // ============================================================
 // УТИЛИТЫ ВРЕМЕНИ
@@ -212,6 +236,25 @@ static void broadcast(MessageType type, const std::string& payload, int senderSo
         catch (...) { /* умерший клиент уберёт его поток */ }
     }
 }
+
+
+// Фоновый поток: читает ответы STM и рассылает всем клиентам
+static void uartReadLoop() {
+    char buf[256];
+    std::string partial;
+    while (g_running && g_uartFd >= 0) {
+        int n = read(g_uartFd, buf, sizeof(buf));
+        if (n > 0) {
+            partial.append(buf, n);
+            // Рассылаем накопленное (можно разбить по '\n')
+            broadcast(MessageType::UartData, partial, -1);
+            partial.clear();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
+
 
 // ============================================================
 // ЧТЕНИЕ /proc И /sys
@@ -464,6 +507,14 @@ static void handleClient(int clientSocket, int colorIdx, std::string clientColor
                     }
                     break;
                 }
+                case MessageType::UartSend: {
+                    std::string cmd(msg.begin(), msg.end());
+                    logEvent("[UART→] from " + username + ": " + cmd);
+                    std::lock_guard<std::mutex> ul(g_uartMutex);
+                    if (g_uartFd >= 0)
+                        write(g_uartFd, cmd.data(), cmd.size());
+                    break;
+                }
                 case MessageType::Disconnect:
                     goto done;
                 default:
@@ -550,6 +601,11 @@ int main() {
 
     g_logFile.open(LOG_PATH, std::ios::app);
     logEvent("=== Server started ===");
+
+    if (!openUart("/dev/ttyAMA0", B9600))
+        std::cerr << "Warning: UART not available\n";
+    else
+        std::thread(uartReadLoop).detach();
 
     g_serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_serverSock < 0) { std::cerr << "socket() failed\n"; return 1; }

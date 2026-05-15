@@ -31,8 +31,17 @@ enum class MessageType : uint32_t {
     Disconnect    = 3,  // Уведомление об отключении
     LogRequest    = 4,  // Запрос от клиента: TEMP / STATUS / TEST / ALL / WARNINGS / LAST N
     LogResponse   = 5,  // Ответ сервера на LogRequest
-    Warning       = 6   // Предупреждение от сервера
+    Warning       = 6,   // Предупреждение от сервера
+    UartSend   = 7,   // клиент шлёт команду на STM
+    UartData   = 8    // RPi пересылает ответ STM клиенту
 };
+
+
+static void sendUartCommand(const std::string& cmd) {
+    MessageHeader header{ (uint32_t)MessageType::UartSend, (uint32_t)cmd.size() };
+    sendAll((char*)&header, sizeof(header));
+    sendAll(cmd.data(), (int)cmd.size());
+}
 
 
 // Опасно если клиент на Windows, сервер на Linux (Raspberry Pi)
@@ -168,6 +177,9 @@ static void receiveLoop() {
                               << text << "\033[0m\n";       // сброс цвета
                     break;
                 case MessageType::Text:                     // Обычное чат-сообщение
+                case MessageType::UartData:
+                    std::cout << "\n[STM] " << text << "\n";
+                    break;
                 default:                                    // Неизвестный тип — тоже как текст
                     std::cout << "\n" << text << "\n";
                     break;
@@ -291,11 +303,12 @@ static std::string normalizeCommand(const std::string& input, std::string& rest)
         {"/status",     "/status"},    {"/s",  "/status"},   // /s → /status
         {"/test",       "/test"},                             // алиасов нет
         {"/logs",       "/logs"},      {"/l",  "/logs"},     // /l → /logs
+        {"/uart", "/uart"},            {"/u", "/uart"},
     };
     for (auto& p : table)                                   // Перебираем всю таблицу алиасов
         if (head == p.first) return p.second;               // Нашли совпадение → возвращаем канон
 
-    return head; // неизвестная команда — вернём как есть для сообщения об ошибке
+    return head; // для сообщения об ошибке
 }
 
 
@@ -334,7 +347,8 @@ static void printHelp() {
         "  /logs last <minutes>     (/l l N) logs for last N minutes\n"
         "  /help                    (/h, /?)this help\n"
         "  /exit                    (/q)    quit\n"
-        "Anything else is sent as a chat message.\n\n";
+        "  Anything else is sent as a chat message.\n\n"
+        "  /uart <cmd>              (/u)    send command to STM/Arduino via UART\n";
 }
 
 
@@ -408,6 +422,11 @@ static void clientLoop() {
                     continue;
                 }
                 sendLogRequest(payload);                    // Отправляем запрос на сервер
+            }
+            else if (cmd == "/uart") {
+                if (!g_connected) { std::cout << "Not connected.\n"; continue; }
+                if (rest.empty()) { std::cout << "Usage: /uart <command>\n"; continue; }
+                sendUartCommand(rest + "\n");  // \n как терминатор для STM
             }
             else {
                 std::cout << "Unknown command '" << cmd << "'. Type /help.\n"; // Неизвестная команда
