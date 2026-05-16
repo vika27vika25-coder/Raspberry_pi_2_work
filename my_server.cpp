@@ -602,7 +602,7 @@ int main() {
     g_logFile.open(LOG_PATH, std::ios::app);
     logEvent("=== Server started ===");
 
-    if (!openUart("/dev/ttyAMA0", B9600))
+    if (!openUart("/dev/ttyUSB0", B9600))
         std::cerr << "Warning: UART not available\n";
     else
         std::thread(uartReadLoop).detach();

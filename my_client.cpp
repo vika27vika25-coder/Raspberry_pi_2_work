@@ -22,27 +22,19 @@
 // Говорит компоновщику автоматически подключить библиотеку WinSock2
 #pragma comment(lib, "Ws2_32.lib")
 
- 
+
 // ПРОТОКОЛ (совпадает с сервером)
 // Перечисление типов сообщений; хранится как uint32_t для совместимости с заголовком
 enum class MessageType : uint32_t {
-    Text          = 1,  // Обычное чат-сообщение
-    Connect       = 2,  // Уведомление о подключении
-    Disconnect    = 3,  // Уведомление об отключении
-    LogRequest    = 4,  // Запрос от клиента: TEMP / STATUS / TEST / ALL / WARNINGS / LAST N
-    LogResponse   = 5,  // Ответ сервера на LogRequest
-    Warning       = 6,   // Предупреждение от сервера
-    UartSend   = 7,   // клиент шлёт команду на STM
-    UartData   = 8    // RPi пересылает ответ STM клиенту
+    Text       = 1,  // Обычное чат-сообщение
+    Connect    = 2,  // Уведомление о подключении
+    Disconnect = 3,  // Уведомление об отключении
+    LogRequest = 4,  // Запрос от клиента: TEMP / STATUS / TEST / ALL / WARNINGS / LAST N
+    LogResponse= 5,  // Ответ сервера на LogRequest
+    Warning    = 6,  // Предупреждение от сервера
+    UartSend   = 7,  // клиент шлёт команду на STM
+    UartData   = 8   // RPi пересылает ответ STM клиенту
 };
-
-
-static void sendUartCommand(const std::string& cmd) {
-    MessageHeader header{ (uint32_t)MessageType::UartSend, (uint32_t)cmd.size() };
-    sendAll((char*)&header, sizeof(header));
-    sendAll(cmd.data(), (int)cmd.size());
-}
-
 
 // Опасно если клиент на Windows, сервер на Linux (Raspberry Pi)
 // Отключаем выравнивание структуры, чтобы она занимала ровно 8 байт в сети
@@ -56,7 +48,7 @@ struct MessageHeader {
 // Максимально допустимый размер тела одного сообщения: 1 МБ (1 << 20 = 1 048 576)
 constexpr uint32_t MAX_PAYLOAD = 1u << 20;
 
- 
+
 // СОСТОЯНИЕ
 // Дескриптор активного TCP-сокета; INVALID_SOCKET = «нет соединения»
 static SOCKET g_socket = INVALID_SOCKET;
@@ -69,7 +61,7 @@ static std::mutex g_coutMutex;
 // Имя пользователя, введённое при старте; используется в заголовках чат-сообщений
 static std::string g_username;
 
- 
+
 // КОНСОЛЬ И UTF-8
 static void setupConsole() {
     SetConsoleOutputCP(CP_UTF8);            // Устанавливаем кодовую страницу вывода на UTF-8
@@ -83,7 +75,7 @@ static void setupConsole() {
     }
 }
 
- 
+
 // ИНИЦИАЛИЗАЦИЯ WinSock2
 static void initWinSock() {
     WSADATA wsa;                        // Структура с информацией о версии WinSock
@@ -92,17 +84,16 @@ static void initWinSock() {
 // Освобождает ресурсы WinSock при завершении программы
 static void cleanupWinSock() { WSACleanup(); }
 
- 
+
 // УТИЛИТЫ
 static std::string getCurrentTime() {
-    time_t now = time(nullptr);         // Получаем текущее время в секундах
-    struct tm ti;                       // Структура для хранения разобранного времени
-    localtime_s(&ti, &now);             // Конвертируем timestamp в локальное время (потокобезопасно)
-    char buf[16];                       // Буфер для строки времени
+    time_t now = time(nullptr);          // Получаем текущее время в секундах
+    struct tm ti;                        // Структура для хранения разобранного времени
+    localtime_s(&ti, &now);              // Конвертируем timestamp в локальное время (потокобезопасно)
+    char buf[16];                        // Буфер для строки времени
     strftime(buf, sizeof(buf), "%H:%M:%S", &ti); // Форматируем: часы:минуты:секунды
-    return buf;                         // Возвращает строку в виде "14:35:07"
+    return buf;                          // Возвращает строку в виде "14:35:07"
 }
-
 
 // Гарантированно отправляет ровно size байт; throw при ошибке сети
 static void sendAll(const char* data, int size) {
@@ -114,7 +105,6 @@ static void sendAll(const char* data, int size) {
     }
 }
 
-
 // Гарантированно принимает ровно size байт; throw при ошибке/закрытии соединения
 static void recvAll(char* data, int size) {
     int got = 0;                                        // Счётчик уже принятых байт
@@ -125,7 +115,32 @@ static void recvAll(char* data, int size) {
     }
 }
 
- 
+
+// ОТПРАВКА
+static void sendChat(const std::string& input) {
+    // Формируем тело: username HH:MM:SS
+    std::string body = "[" + g_username + " " + getCurrentTime() + "] " + input;
+    MessageHeader header{ (uint32_t)MessageType::Text, (uint32_t)body.size() }; // Заголовок типа Text
+    sendAll((char*)&header, sizeof(header));                // Отправляем заголовок
+    sendAll(body.data(), (int)body.size());                 // Отправляем тело сообщения
+}
+
+static void sendLogRequest(const std::string& payload) {
+    // Формируем заголовок запроса; payload = "TEMP", "STATUS", "ALL", "WARNINGS", "LAST N"
+    MessageHeader header{ (uint32_t)MessageType::LogRequest,
+                          (uint32_t)payload.size() };
+    sendAll((char*)&header, sizeof(header));                // Отправляем заголовок
+    if (!payload.empty()) sendAll(payload.data(), (int)payload.size()); // Отправляем тело (если есть)
+}
+
+// ИСПРАВЛЕНО: перенесено после sendAll и MessageHeader, которые она использует
+static void sendUartCommand(const std::string& cmd) {
+    MessageHeader header{ (uint32_t)MessageType::UartSend, (uint32_t)cmd.size() };
+    sendAll((char*)&header, sizeof(header));
+    sendAll(cmd.data(), (int)cmd.size());
+}
+
+
 // ВВОД ИМЕНИ
 static std::string askUsername() {
     while (true) {                                          // Бесконечный цикл до ввода корректного имени
@@ -147,7 +162,7 @@ static std::string askUsername() {
     }
 }
 
- 
+
 // ПОТОК ПРИЁМА
 // Выводит приглашение "> " без перевода строки (flush нужен для немедленного отображения)
 static void printPrompt() { std::cout << "> " << std::flush; }
@@ -176,9 +191,11 @@ static void receiveLoop() {
                     std::cout << "\n\033[31m[!! SERVER WARNING] " // красный цвет
                               << text << "\033[0m\n";       // сброс цвета
                     break;
-                case MessageType::Text:                     // Обычное чат-сообщение
-                case MessageType::UartData:
+                case MessageType::UartData:                 // RPi пересылает ответ STM клиенту
                     std::cout << "\n[STM] " << text << "\n";
+                    break;
+                case MessageType::Text:                     // Обычное чат-сообщение
+                    std::cout << "\n" << text << "\n";
                     break;
                 default:                                    // Неизвестный тип — тоже как текст
                     std::cout << "\n" << text << "\n";
@@ -197,7 +214,7 @@ static void receiveLoop() {
     }
 }
 
- 
+
 // CONNECT / DISCONNECT
 static bool connectToServer(const std::string& ip, int port) {
     g_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);   // Создаём TCP-сокет (IPv4)
@@ -257,25 +274,7 @@ static void disconnectFromServer() {
     std::cout << "Disconnected.\n";                         // Подтверждаем пользователю отключение
 }
 
- 
-// ОТПРАВКА
-static void sendChat(const std::string& input) {
-    // Формируем тело: username HH:MM:SS
-    std::string body = "[" + g_username + " " + getCurrentTime() + "] " + input;
-    MessageHeader header{ (uint32_t)MessageType::Text, (uint32_t)body.size() }; // Заголовок типа Text
-    sendAll((char*)&header, sizeof(header));                // Отправляем заголовок
-    sendAll(body.data(), (int)body.size());                 // Отправляем тело сообщения
-}
 
-static void sendLogRequest(const std::string& payload) {
-    // Формируем заголовок запроса; payload = "TEMP", "STATUS", "ALL", "WARNINGS", "LAST N"
-    MessageHeader header{ (uint32_t)MessageType::LogRequest,
-                          (uint32_t)payload.size() };
-    sendAll((char*)&header, sizeof(header));                // Отправляем заголовок
-    if (!payload.empty()) sendAll(payload.data(), (int)payload.size()); // Отправляем тело (если есть)
-}
-
- 
 // НОРМАЛИЗАЦИЯ КОМАНД
 // Возвращает каноническую форму команды (первое слово), всё остальное
 // в `rest`. Если ввод не похож на команду — возвращает "".
@@ -303,14 +302,13 @@ static std::string normalizeCommand(const std::string& input, std::string& rest)
         {"/status",     "/status"},    {"/s",  "/status"},   // /s → /status
         {"/test",       "/test"},                             // алиасов нет
         {"/logs",       "/logs"},      {"/l",  "/logs"},     // /l → /logs
-        {"/uart", "/uart"},            {"/u", "/uart"},
+        {"/uart",       "/uart"},      {"/u",  "/uart"},     // /u → /uart
     };
     for (auto& p : table)                                   // Перебираем всю таблицу алиасов
         if (head == p.first) return p.second;               // Нашли совпадение → возвращаем канон
 
     return head; // для сообщения об ошибке
 }
-
 
 // Внутри /logs тоже принимаем сокращения подкоманд.
 // Возвращает payload для сервера ("ALL", "WARNINGS", "LAST N"), или "" если ошибка.
@@ -332,7 +330,7 @@ static std::string buildLogsPayload(const std::string& rest) {
     return "";                                              // Неизвестная подкоманда → ошибка
 }
 
- 
+
 // HELP
 static void printHelp() {
     std::cout <<                                            // Выводим справку одной строковой константой
@@ -347,8 +345,8 @@ static void printHelp() {
         "  /logs last <minutes>     (/l l N) logs for last N minutes\n"
         "  /help                    (/h, /?)this help\n"
         "  /exit                    (/q)    quit\n"
-        "  Anything else is sent as a chat message.\n\n"
-        "  /uart <cmd>              (/u)    send command to STM/Arduino via UART\n";
+        "  /uart <cmd>              (/u)    send command to STM/Arduino via UART\n"
+        "  Anything else is sent as a chat message.\n\n";
 }
 
 
@@ -423,10 +421,10 @@ static void clientLoop() {
                 }
                 sendLogRequest(payload);                    // Отправляем запрос на сервер
             }
-            else if (cmd == "/uart") {
+            else if (cmd == "/uart") {                      // Команда отправки данных на STM через UART
                 if (!g_connected) { std::cout << "Not connected.\n"; continue; }
                 if (rest.empty()) { std::cout << "Usage: /uart <command>\n"; continue; }
-                sendUartCommand(rest + "\n");  // \n как терминатор для STM
+                sendUartCommand(rest + "\n");               // \n как терминатор для STM
             }
             else {
                 std::cout << "Unknown command '" << cmd << "'. Type /help.\n"; // Неизвестная команда

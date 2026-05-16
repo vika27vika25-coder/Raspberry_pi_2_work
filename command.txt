@@ -1,0 +1,12 @@
+server
+
+ssh 10.138.93.229 -l pi
+sudo apt update
+sudo apt install g++ build-essential
+g++ my_server.cpp -o my_server
+./my_server
+
+client
+
+cd C:\Users\Пользователь\OneDrive\Документы\6 семестр\Raspberry_pi_2_work
+my_client.exe
