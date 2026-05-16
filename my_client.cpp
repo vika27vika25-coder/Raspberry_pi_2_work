@@ -302,7 +302,8 @@ static std::string normalizeCommand(const std::string& input, std::string& rest)
         {"/status",     "/status"},    {"/s",  "/status"},   // /s → /status
         {"/test",       "/test"},                             // алиасов нет
         {"/logs",       "/logs"},      {"/l",  "/logs"},     // /l → /logs
-        {"/uart",       "/uart"},      {"/u",  "/uart"},     // /u → /uart
+        {"/uart_all",  "/uart_all"},  
+        {"/uart_last", "/uart_last"},
     };
     for (auto& p : table)                                   // Перебираем всю таблицу алиасов
         if (head == p.first) return p.second;               // Нашли совпадение → возвращаем канон
@@ -345,7 +346,8 @@ static void printHelp() {
         "  /logs last <minutes>     (/l l N) logs for last N minutes\n"
         "  /help                    (/h, /?)this help\n"
         "  /exit                    (/q)    quit\n"
-        "  /uart <cmd>              (/u)    send command to STM/Arduino via UART\n"
+        "  /uart_all                       all Arduino sensor logs\n"
+        "  /uart_last <minutes>            Arduino logs for last N minutes\n"
         "  Anything else is sent as a chat message.\n\n";
 }
 
@@ -405,6 +407,15 @@ static void clientLoop() {
             else if (cmd == "/status") {                    // Запрос полного статуса системы
                 if (!g_connected) { std::cout << "Not connected.\n"; continue; }
                 sendLogRequest("STATUS");                   // Шлём серверу запрос "STATUS"
+            }
+            else if (cmd == "/uart_all") {
+                if (!g_connected) { std::cout << "Not connected.\n"; continue; }
+                sendLogRequest("UART_ALL");
+            }
+            else if (cmd == "/uart_last") {
+                if (!g_connected) { std::cout << "Not connected.\n"; continue; }
+                if (rest.empty()) { std::cout << "Usage: /uart_last <minutes>\n"; continue; }
+                sendLogRequest("UART_LAST " + rest);
             }
             else if (cmd == "/test") {                      // Запрос тестовых сообщений от сервера
                 if (!g_connected) { std::cout << "Not connected.\n"; continue; }

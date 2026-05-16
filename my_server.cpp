@@ -101,6 +101,7 @@ static int               g_serverSock = -1;
 static std::ofstream             g_logFile;
 static std::vector<std::string>  g_logBuffer;
 static std::vector<std::string>  g_warningBuffer;
+static std::vector<std::string>  g_uartBuffer;
 static std::mutex                g_logMutex;
 
 
@@ -246,9 +247,26 @@ static void uartReadLoop() {
         int n = read(g_uartFd, buf, sizeof(buf));
         if (n > 0) {
             partial.append(buf, n);
-            // Рассылаем накопленное (можно разбить по '\n')
-            broadcast(MessageType::UartData, partial, -1);
-            partial.clear();
+            // Отправляем только целые строки (до \n)
+            size_t pos;
+            while ((pos = partial.find('\n')) != std::string::npos) {
+                std::string line = partial.substr(0, pos);
+                if (!line.empty()) {
+                    // сохраняем в буфер
+                    {
+                        std::lock_guard<std::mutex> lock(g_logMutex);
+                        std::string entry = "[" + getSystemTimeFull() + "] " + line;
+                        g_uartBuffer.push_back(entry);
+                        if (g_uartBuffer.size() > 10000)
+                            g_uartBuffer.erase(g_uartBuffer.begin(), g_uartBuffer.begin() + 2000);
+                    }
+                    broadcast(MessageType::UartData, line, -1);
+                }
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();  // убираем \r если есть
+               
+                partial = partial.substr(pos + 1);
+            }
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -397,6 +415,35 @@ static std::string handleLogRequest(const std::string& request) {
         for (auto& l : g_warningBuffer) oss << l << '\n';
         auto s = oss.str();
         return s.empty() ? "No warnings recorded.\n" : s;
+    }
+    if (request == "UART_ALL") {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ostringstream oss;
+    for (auto& l : g_uartBuffer) oss << l << '\n';
+    auto s = oss.str();
+    return s.empty() ? "No UART data yet.\n" : s;
+    }
+    if (request.rfind("UART_LAST ", 0) == 0) {
+        int minutes = 0;
+        try { minutes = std::stoi(request.substr(10)); }
+        catch (...) { return "Bad argument.\n"; }
+        if (minutes <= 0) return "Minutes must be > 0.\n";
+        time_t now = time(nullptr);
+        std::ostringstream oss;
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        for (auto& line : g_uartBuffer) {
+            if (line.size() < 21) continue;
+            std::tm tm{};
+            std::istringstream ss(line.substr(1, 19));
+            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+            if (ss.fail()) continue;
+            tm.tm_isdst = -1;
+            time_t logTime = mktime(&tm);
+            if (difftime(now, logTime) <= minutes * 60)
+                oss << line << '\n';
+        }
+        auto s = oss.str();
+        return s.empty() ? "No UART data in this interval.\n" : s;
     }
     if (request.rfind("LAST ", 0) == 0) {
         int minutes = 0;
