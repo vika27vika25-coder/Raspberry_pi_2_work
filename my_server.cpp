@@ -1,6 +1,6 @@
 // ============================================================
-//  Server (Raspberry Pi side) – UART только для сбора данных
-//  Команды: /uart_all, /uart_last работают, /uart – удалена
+//  Server (Raspberry Pi side) 132
+//  Build: g++ -std=c++17 -O2 -pthread server.cpp -o server
 // ============================================================
 #include <iostream>
 #include <vector>
@@ -28,10 +28,10 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <errno.h>
-#include <termios.h>   // для UART
+#include <termios.h>
 
 // ============================================================
-// ПРОТОКОЛ (UartSend и UartData удалены)
+// ПРОТОКОЛ
 // ============================================================
 enum class MessageType : uint32_t {
     Text        = 1,
@@ -39,8 +39,9 @@ enum class MessageType : uint32_t {
     Disconnect  = 3,
     LogRequest  = 4,
     LogResponse = 5,
-    Warning     = 6
-    // UartSend=7, UartData=8 – удалены
+    Warning     = 6,
+    UartSend    = 7,
+    UartData    = 8
 };
 
 #pragma pack(push, 1)
@@ -61,7 +62,6 @@ constexpr int    MONITOR_INTERVAL_SEC = 10;
 constexpr double CPU_TEMP_LIMIT       = 70.0;
 constexpr int    RAM_LIMIT_PERCENT    = 80;
 constexpr const char* LOG_PATH        = "server.log";
-
 constexpr int    TEST_COUNT           = 10;
 constexpr int    TEST_INTERVAL_MS     = 500;
 
@@ -78,11 +78,14 @@ struct Client {
     std::shared_ptr<std::mutex> sendMutex;
 };
 
-static std::vector<Client> g_clients;
-static std::mutex          g_clientsMutex;
+static std::vector<Client>        g_clients;
+static std::mutex                 g_clientsMutex;
 
 static std::map<int, std::string> g_usedColors;
 static std::mutex                 g_colorsMutex;
+
+static int        g_uartFd = -1;
+static std::mutex g_uartMutex;
 
 static const std::vector<std::string> g_colorPool = {
     "\033[31m","\033[32m","\033[33m",
@@ -96,13 +99,28 @@ static int               g_serverSock = -1;
 static std::ofstream             g_logFile;
 static std::vector<std::string>  g_logBuffer;
 static std::vector<std::string>  g_warningBuffer;
+static std::vector<std::string>  g_uartBuffer;   // буфер данных с Arduino
 static std::mutex                g_logMutex;
 
-// UART (только чтение, накопление логов)
-static int               g_uartFd = -1;
-static std::mutex        g_uartMutex;
-static std::vector<std::string> g_uartBuffer;
-static std::mutex        g_uartBufferMutex;  // отдельный мьютекс для буфера UART
+// ============================================================
+// UART
+// ============================================================
+static bool openUart(const char* device = "/dev/ttyUSB0", int baud = B9600) {
+    g_uartFd = open(device, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (g_uartFd < 0) return false;
+    termios opts{};
+    tcgetattr(g_uartFd, &opts);
+    cfsetispeed(&opts, baud);
+    cfsetospeed(&opts, baud);
+    opts.c_cflag |= (CLOCAL | CREAD);
+    opts.c_cflag &= ~PARENB;
+    opts.c_cflag &= ~CSTOPB;
+    opts.c_cflag &= ~CSIZE;
+    opts.c_cflag |= CS8;
+    opts.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tcsetattr(g_uartFd, TCSANOW, &opts);
+    return true;
+}
 
 // ============================================================
 // УТИЛИТЫ ВРЕМЕНИ
@@ -152,10 +170,9 @@ static void sendAllRaw(int sock, const char* data, size_t size) {
 static void sendFrame(int sock, std::mutex& m,
                       MessageType type, const std::string& payload)
 {
-    MessageHeader header{ static_cast<uint32_t>(type),
-                          static_cast<uint32_t>(payload.size()) };
+    MessageHeader header{ (uint32_t)type, (uint32_t)payload.size() };
     std::lock_guard<std::mutex> lock(m);
-    sendAllRaw(sock, reinterpret_cast<char*>(&header), sizeof(header));
+    sendAllRaw(sock, (char*)&header, sizeof(header));
     if (!payload.empty())
         sendAllRaw(sock, payload.data(), payload.size());
 }
@@ -172,7 +189,7 @@ static void recvAll(int sock, char* data, size_t size) {
 static std::string peerId(int sock) {
     sockaddr_in addr{};
     socklen_t len = sizeof(addr);
-    if (getpeername(sock, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
+    if (getpeername(sock, (sockaddr*)&addr, &len) == 0) {
         char ipBuf[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &addr.sin_addr, ipBuf, sizeof(ipBuf));
         return std::string(ipBuf) + ":" + std::to_string(ntohs(addr.sin_port));
@@ -185,7 +202,7 @@ static std::string peerId(int sock) {
 // ============================================================
 static int acquireColor(const std::string& id) {
     std::lock_guard<std::mutex> lock(g_colorsMutex);
-    for (int i = 0; i < static_cast<int>(g_colorPool.size()); ++i) {
+    for (int i = 0; i < (int)g_colorPool.size(); ++i) {
         if (!g_usedColors.count(i)) {
             g_usedColors[i] = id;
             return i;
@@ -200,7 +217,7 @@ static void releaseColor(int idx) {
 }
 
 // ============================================================
-// BROADCAST (без UART данных)
+// BROADCAST
 // ============================================================
 static void broadcast(MessageType type, const std::string& payload, int senderSock) {
     std::vector<std::pair<int, std::shared_ptr<std::mutex>>> targets;
@@ -212,10 +229,38 @@ static void broadcast(MessageType type, const std::string& payload, int senderSo
                 targets.emplace_back(c.socket, c.sendMutex);
     }
     for (auto& t : targets) {
-        try {
-            sendFrame(t.first, *t.second, type, payload);
-        } catch (...) {
-            // клиент будет удалён при следующей ошибке
+        try { sendFrame(t.first, *t.second, type, payload); }
+        catch (...) {}
+    }
+}
+
+// ============================================================
+// UART READ LOOP — только сохраняет, не рассылает
+// ============================================================
+static void uartReadLoop() {
+    char buf[256];
+    std::string partial;
+    while (g_running && g_uartFd >= 0) {
+        int n = read(g_uartFd, buf, sizeof(buf));
+        if (n > 0) {
+            partial.append(buf, n);
+            size_t pos;
+            while ((pos = partial.find('\n')) != std::string::npos) {
+                std::string line = partial.substr(0, pos);
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                if (!line.empty()) {
+                    std::lock_guard<std::mutex> lock(g_logMutex);
+                    std::string entry = "[" + getSystemTimeFull() + "] " + line;
+                    g_uartBuffer.push_back(entry);
+                    if (g_uartBuffer.size() > 10000)
+                        g_uartBuffer.erase(g_uartBuffer.begin(),
+                                           g_uartBuffer.begin() + 2000);
+                }
+                partial = partial.substr(pos + 1);
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }
@@ -227,9 +272,9 @@ static std::string getUptime() {
     std::ifstream f("/proc/uptime");
     double seconds = 0;
     if (!(f >> seconds)) return "Unknown";
-    int hrs  = static_cast<int>(seconds) / 3600;
-    int mins = (static_cast<int>(seconds) % 3600) / 60;
-    int secs = static_cast<int>(seconds) % 60;
+    int hrs  =  (int)seconds / 3600;
+    int mins = ((int)seconds % 3600) / 60;
+    int secs =  (int)seconds % 60;
     std::ostringstream oss;
     oss << hrs << "h " << mins << "m " << secs << "s";
     return oss.str();
@@ -245,8 +290,7 @@ static int getRAMUsagePercent() {
         f.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
     if (total <= 0) return 0;
-    long used = total - available;
-    return static_cast<int>((used * 100) / total);
+    return (int)(((total - available) * 100) / total);
 }
 
 static double getCPUTempValue() {
@@ -285,55 +329,6 @@ static std::string buildStatusString() {
 }
 
 // ============================================================
-// UART – только чтение и накопление логов (без отправки клиентам)
-// ============================================================
-static bool openUart(const char* device = "/dev/ttyAMA0", int baud = B9600) {
-    g_uartFd = open(device, O_RDWR | O_NOCTTY | O_NDELAY);
-    if (g_uartFd < 0) return false;
-    termios opts{};
-    tcgetattr(g_uartFd, &opts);
-    cfsetispeed(&opts, baud);
-    cfsetospeed(&opts, baud);
-    opts.c_cflag |= (CLOCAL | CREAD);
-    opts.c_cflag &= ~PARENB;
-    opts.c_cflag &= ~CSTOPB;
-    opts.c_cflag &= ~CSIZE;
-    opts.c_cflag |= CS8;
-    opts.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-    tcsetattr(g_uartFd, TCSANOW, &opts);
-    return true;
-}
-
-static void uartReadLoop() {
-    char buf[256];
-    std::string partial;
-    while (g_running && g_uartFd >= 0) {
-        int n = read(g_uartFd, buf, sizeof(buf));
-        if (n > 0) {
-            partial.append(buf, n);
-            size_t pos;
-            while ((pos = partial.find('\n')) != std::string::npos) {
-                std::string line = partial.substr(0, pos);
-                if (!line.empty()) {
-                    // Сохраняем в буфер UART (для последующего запроса /uart_all, /uart_last)
-                    std::string entry = "[" + getSystemTimeFull() + "] " + line;
-                    {
-                        std::lock_guard<std::mutex> lock(g_uartBufferMutex);
-                        g_uartBuffer.push_back(entry);
-                        if (g_uartBuffer.size() > 10000)
-                            g_uartBuffer.erase(g_uartBuffer.begin(), g_uartBuffer.begin() + 2000);
-                    }
-                    // НЕТ broadcast(MessageType::UartData, line, -1);
-                }
-                partial = partial.substr(pos + 1);
-            }
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
-}
-
-// ============================================================
 // ФОНОВЫЙ МОНИТОР
 // ============================================================
 static void monitoringLoop() {
@@ -366,7 +361,7 @@ static void monitoringLoop() {
 }
 
 // ============================================================
-// TEST: 10 сообщений с интервалом
+// TEST
 // ============================================================
 static void runTestFlood(int sock, std::shared_ptr<std::mutex> sendMutex,
                          std::string username)
@@ -380,19 +375,16 @@ static void runTestFlood(int sock, std::shared_ptr<std::mutex> sendMutex,
         }
         sendFrame(sock, *sendMutex, MessageType::LogResponse,
                   "Test flood finished (" + std::to_string(TEST_COUNT) + " messages).\n");
-    } catch (...) {
-        // клиент отвалился – игнор
-    }
+    } catch (...) {}
     logEvent("Test flood for '" + username + "' done.");
 }
 
 // ============================================================
-// Обработка LogRequest (включая UART_ALL и UART_LAST)
+// LOG REQUEST HANDLER
 // ============================================================
 static std::string handleLogRequest(const std::string& request) {
     if (request == "TEMP") {
-        double t = getCPUTempValue();
-        return "CPU temperature: " + formatTemp(t) + "\n";
+        return "CPU temperature: " + formatTemp(getCPUTempValue()) + "\n";
     }
     if (request == "STATUS") {
         return buildStatusString();
@@ -411,64 +403,61 @@ static std::string handleLogRequest(const std::string& request) {
         auto s = oss.str();
         return s.empty() ? "No warnings recorded.\n" : s;
     }
-    if (request == "UART_ALL") {
-        std::lock_guard<std::mutex> lock(g_uartBufferMutex);
-        std::ostringstream oss;
-        for (auto& l : g_uartBuffer) oss << l << '\n';
-        auto s = oss.str();
-        return s.empty() ? "No UART data yet.\n" : s;
-    }
-    if (request.rfind("UART_LAST ", 0) == 0) {
-        int minutes = 0;
-        try { minutes = std::stoi(request.substr(10)); }
-        catch (...) { return "Bad argument.\n"; }
-        if (minutes <= 0) return "Minutes must be > 0.\n";
-
-        time_t now = time(nullptr);
-        std::ostringstream oss;
-        std::lock_guard<std::mutex> lock(g_uartBufferMutex);
-        for (auto& line : g_uartBuffer) {
-            if (line.size() < 21) continue;
-            std::tm tm{};
-            std::istringstream ss(line.substr(1, 19));
-            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-            if (ss.fail()) continue;
-            tm.tm_isdst = -1;
-            time_t logTime = mktime(&tm);
-            if (difftime(now, logTime) <= minutes * 60)
-                oss << line << '\n';
-        }
-        auto s = oss.str();
-        return s.empty() ? "No UART data in this interval.\n" : s;
-    }
     if (request.rfind("LAST ", 0) == 0) {
         int minutes = 0;
         try { minutes = std::stoi(request.substr(5)); }
         catch (...) { return "Bad LAST argument.\n"; }
         if (minutes <= 0) return "Minutes must be > 0.\n";
-
         time_t now = time(nullptr);
         std::ostringstream oss;
         std::lock_guard<std::mutex> lock(g_logMutex);
-        for (auto& line : g_logBuffer) {
-            if (line.size() < 21) continue;
+        for (auto& l : g_logBuffer) {
+            if (l.size() < 21) continue;
             std::tm tm{};
-            std::istringstream ss(line.substr(1, 19));
+            std::istringstream ss(l.substr(1, 19));
             ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
             if (ss.fail()) continue;
             tm.tm_isdst = -1;
-            time_t logTime = mktime(&tm);
-            if (difftime(now, logTime) <= minutes * 60)
-                oss << line << '\n';
+            if (difftime(now, mktime(&tm)) <= minutes * 60)
+                oss << l << '\n';
         }
         auto s = oss.str();
         return s.empty() ? "No logs in the requested interval.\n" : s;
+    }
+    // --- SENSOR команды ---
+    if (request == "SENSOR_ALL") {
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        std::ostringstream oss;
+        for (auto& l : g_uartBuffer) oss << l << '\n';
+        auto s = oss.str();
+        return s.empty() ? "No sensor data yet.\n" : s;
+    }
+    if (request.rfind("SENSOR_LAST ", 0) == 0) {
+        int minutes = 0;
+        try { minutes = std::stoi(request.substr(12)); }
+        catch (...) { return "Bad argument.\n"; }
+        if (minutes <= 0) return "Minutes must be > 0.\n";
+        time_t now = time(nullptr);
+        std::ostringstream oss;
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        for (auto& l : g_uartBuffer) {
+            if (l.size() < 21) continue;
+            std::tm tm{};
+            std::istringstream ss(l.substr(1, 19));
+            ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+            if (ss.fail()) continue;
+            tm.tm_isdst = -1;
+            if (difftime(now, mktime(&tm)) <= minutes * 60)
+                oss << l << '\n';
+        }
+        auto s = oss.str();
+        return s.empty() ? "No sensor data in this interval.\n" : s;
     }
     return "Unknown log request.\n";
 }
 
 // ============================================================
-// КЛИЕНТСКИЙ ПОТОК (без обработки UartSend)
+// КЛИЕНТСКИЙ ПОТОК
 // ============================================================
 static void handleClient(int clientSocket, int colorIdx, std::string clientColor,
                          std::shared_ptr<std::mutex> sendMutex)
@@ -484,11 +473,10 @@ static void handleClient(int clientSocket, int colorIdx, std::string clientColor
     };
 
     try {
-        // Приём Connect
         MessageHeader header{};
-        recvAll(clientSocket, reinterpret_cast<char*>(&header), sizeof(header));
+        recvAll(clientSocket, (char*)&header, sizeof(header));
 
-        if (header.type != static_cast<uint32_t>(MessageType::Connect) ||
+        if (header.type != (uint32_t)MessageType::Connect ||
             header.size == 0 || header.size > MAX_USERNAME)
         {
             close(clientSocket);
@@ -515,32 +503,31 @@ static void handleClient(int clientSocket, int colorIdx, std::string clientColor
                   << " joined as '" << username << "'" << RESET << "\n";
         logEvent("Client " + clientId + " joined as '" + username + "'");
         broadcast(MessageType::Text,
-                  "*** " + username + " joined the chat ***",
-                  clientSocket);
+                  "*** " + username + " joined the chat ***", clientSocket);
 
-        // Главный цикл
         while (g_running) {
-            recvAll(clientSocket, reinterpret_cast<char*>(&header), sizeof(header));
+            recvAll(clientSocket, (char*)&header, sizeof(header));
             if (header.size > MAX_PAYLOAD) break;
 
             std::vector<char> msg(header.size);
             if (header.size > 0) recvAll(clientSocket, msg.data(), header.size);
 
-            switch (static_cast<MessageType>(header.type)) {
+            switch ((MessageType)header.type) {
                 case MessageType::Text: {
                     std::string text(msg.begin(), msg.end());
-                    std::cout << clientColor << "[" << username << "] " << text
-                              << RESET << "\n";
+                    std::cout << clientColor << "[" << username << "] "
+                              << text << RESET << "\n";
                     logEvent("[" + username + "] " + text);
-                    std::string colored = clientColor + text + RESET;
-                    broadcast(MessageType::Text, colored, clientSocket);
+                    broadcast(MessageType::Text,
+                              clientColor + text + RESET, clientSocket);
                     break;
                 }
                 case MessageType::LogRequest: {
                     std::string req(msg.begin(), msg.end());
                     if (req == "TEST") {
                         logEvent("Test flood started for '" + username + "'");
-                        std::thread(runTestFlood, clientSocket, sendMutex, username).detach();
+                        std::thread(runTestFlood, clientSocket,
+                                    sendMutex, username).detach();
                     } else {
                         std::string out = handleLogRequest(req);
                         sendFrame(clientSocket, *sendMutex,
@@ -548,10 +535,17 @@ static void handleClient(int clientSocket, int colorIdx, std::string clientColor
                     }
                     break;
                 }
+                case MessageType::UartSend: {
+                    std::string cmd(msg.begin(), msg.end());
+                    logEvent("[UART→] from " + username + ": " + cmd);
+                    std::lock_guard<std::mutex> ul(g_uartMutex);
+                    if (g_uartFd >= 0)
+                        write(g_uartFd, cmd.data(), cmd.size());
+                    break;
+                }
                 case MessageType::Disconnect:
                     goto done;
                 default:
-                    // Любой неизвестный тип (например, если клиент пришлёт 7 или 8) игнорируем
                     break;
             }
         }
@@ -563,21 +557,20 @@ done:
     logEvent("Client " + clientId + " (" + username + ") disconnected.");
     broadcast(MessageType::Text,
               "*** " + username + " left the chat ***", clientSocket);
-
     cleanup();
     releaseColor(colorIdx);
     close(clientSocket);
 }
 
 // ============================================================
-// ACCEPT LOOP
+// ACCEPT
 // ============================================================
 static void runAcceptLoop() {
     fcntl(g_serverSock, F_SETFL, O_NONBLOCK);
     while (g_running) {
         sockaddr_in addr{};
         socklen_t   len = sizeof(addr);
-        int client = accept(g_serverSock, reinterpret_cast<sockaddr*>(&addr), &len);
+        int client = accept(g_serverSock, (sockaddr*)&addr, &len);
         if (client < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -588,10 +581,10 @@ static void runAcceptLoop() {
             break;
         }
 
-        std::string id = peerId(client);
-        int colorIdx   = acquireColor(id);
+        std::string id    = peerId(client);
+        int colorIdx      = acquireColor(id);
         std::string color = (colorIdx >= 0) ? g_colorPool[colorIdx] : "\033[37m";
-        auto sendMutex = std::make_shared<std::mutex>();
+        auto sendMutex    = std::make_shared<std::mutex>();
 
         Client nc;
         nc.socket     = client;
@@ -608,7 +601,6 @@ static void runAcceptLoop() {
         }
         std::cout << "New connection from " << id << "\n";
         logEvent("New connection from " + id);
-
         std::thread(handleClient, client, colorIdx, color, sendMutex).detach();
     }
 }
@@ -634,9 +626,8 @@ int main() {
     std::signal(SIGPIPE, SIG_IGN);
 
     g_logFile.open(LOG_PATH, std::ios::app);
-    logEvent("=== Server started (UART logging only, no /uart command) ===");
+    logEvent("=== Server started ===");
 
-    // Инициализация UART (только чтение)
     if (!openUart("/dev/ttyUSB0", B9600))
         std::cerr << "Warning: UART not available\n";
     else
@@ -652,7 +643,7 @@ int main() {
     addr.sin_port        = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(g_serverSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (bind(g_serverSock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::cerr << "bind() failed: " << strerror(errno) << "\n"; return 1;
     }
     if (listen(g_serverSock, SOMAXCONN) < 0) {
@@ -661,10 +652,8 @@ int main() {
 
     std::cout << "Server running on port " << PORT << " ...\n"
               << "Monitoring every " << MONITOR_INTERVAL_SEC << "s "
-              << "(CPU > " << CPU_TEMP_LIMIT << "C, RAM > "
+              << "(CPU>" << CPU_TEMP_LIMIT << "C, RAM>"
               << RAM_LIMIT_PERCENT << "% -> WARNING)\n"
-              << "UART data is being logged but NOT broadcast.\n"
-              << "Use /uart_all or /uart_last to retrieve it.\n"
               << "Press Ctrl+C to stop.\n";
 
     std::thread monitor(monitoringLoop);
@@ -674,7 +663,6 @@ int main() {
 
     logEvent("=== Server stopped ===");
     if (g_logFile.is_open()) g_logFile.close();
-    if (g_uartFd >= 0) close(g_uartFd);
     if (g_serverSock >= 0) close(g_serverSock);
     return 0;
 }
